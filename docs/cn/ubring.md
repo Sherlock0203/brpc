@@ -187,7 +187,7 @@ UBRing 架构包含以下组件：
 
 ### 定时器管理
 
-UBRing 使用高精度定时器系统 (`timer_mgr.cpp`) 进行连接管理和超时处理，支持 epoll（Linux）和 kqueue（macOS）。
+UBRing 的连接管理和超时处理基于 bthread 定时器（`bthread_timer_add`/`bthread_timer_del`，由 `timer_mgr.cpp` 封装）：无需为每个定时器分配 fd，删除操作永不阻塞，句柄带引用与停止标记，可安全地在回调内自删。关闭检查定时器在链路空闲时按指数退避轮询（上限 `ub_event_queue_timer_interval_max_us`，默认 10ms），有流量或正在关闭时恢复 `ub_event_queue_timer_interval_us` 的快速轮询。
 
 ## 参考资料
 

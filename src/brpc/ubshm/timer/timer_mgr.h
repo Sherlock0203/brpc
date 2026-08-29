@@ -15,59 +15,48 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Timer facade over bthread timers for the ubring module.
+//
+// Replaces the former timerfd + epoll based timer manager (issue #3463):
+// no fd is allocated per timer, deletion never blocks and handles are
+// versioned task ids, so stale handles can never hit a reused fd.
+
 #ifndef BRPC_TIMER_MGR_H
 #define BRPC_TIMER_MGR_H
-#include <pthread.h>
-#include <time.h>
+
+#include <stdint.h>
 #include "brpc/ubshm/common/common.h"
 
-#if defined(OS_LINUX)
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#elif defined(OS_MACOSX)
-#include <sys/types.h>
-#include <sys/event.h>
-#include <sys/time.h>
-#endif
-
-#define MAX_TIMER 1024
-#define TIMER_EPOLL_WAIT_TIMEOUT 1000
-
-#if defined(OS_MACOSX)
-struct itimerspec
-{
-    struct timespec it_interval;
-    struct timespec it_value;
-};
-#endif
 namespace brpc {
 namespace ubring {
-typedef enum {
-    TIMER_CONTEXT_NOT_USING,
-    TIMER_CONTEXT_EPOLL_WAITING,
-    TIMER_CONTEXT_CALLBACK_ONGOING
-} TimerFdCtxStatus;
 
-typedef struct {
-    void *(*cb)(void*);
-    void *args;
-    uint32_t fd;
-    TimerFdCtxStatus status;
-    uint32_t periodical;
-    pthread_spinlock_t spin_lock;
-} TimerFdCtx;
+// Opaque timer handle. nullptr means "not started" (or already deleted).
+typedef struct UbrTimerTask* UbrTimerId;
 
-RETURN_CODE TimerInit(void);
-void TimerModuleDestroy(void);
-void *UnifiedCallback(void *args);
-void *TimerEpoll(void *args);
-int32_t TimerStart(const itimerspec *time, void *(*cb)(void *), void *args);
+// Optionally maps the current re-arm interval of a periodic timer to the
+// next one. Runs on the timer thread only.
+typedef uint64_t (*UbrTimerBackoffFn)(void* arg, uint64_t cur_interval_us);
+
+// Schedule `cb(arg)' to run once after `delay_us' microseconds. When
+// `interval_us' is greater than zero, the task re-arms itself after every
+// run (through `backoff' if provided) until deleted.
+//
+// The handle is published into *slot which must not be touched by other
+// threads until this call completes. Deletion goes through UbrTimerDel
+// only, which makes the handle safe against double delete.
+void UbrTimerStart(UbrTimerId* slot, uint64_t delay_us, uint64_t interval_us,
+                   void* (*cb)(void*), void* arg,
+                   UbrTimerBackoffFn backoff = nullptr);
+
+// Stop the timer referenced by *slot and release it. Idempotent,
+// non-blocking and safe to call from inside the timer callback itself.
+// The reference in *slot is cleared atomically so concurrent deleters
+// cannot act twice on the same task.
+void UbrTimerDel(UbrTimerId* slot);
+
 uint32_t GetActiveTimerNum(void);
-void CloseTimerFd(int fd);
 
-void DeleteTimerSafe(uint32_t fd);
-void DeleteTimer(uint32_t fd);
-RETURN_CODE TimerFdCtxValidate(uint32_t fd);
-}
-}
+}  // namespace ubring
+}  // namespace brpc
+
 #endif //BRPC_TIMER_MGR_H
