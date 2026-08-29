@@ -377,14 +377,16 @@ RETURN_CODE UbsShmInit(void)
 
 RETURN_CODE UbsShmFini(void)
 {
-    int ret = ubsmem_finalize();
-    if (ret != UBSM_OK) {
-        LOG(ERROR) << "Ubs shm finalize fail, ret=" << ret;
+    // Stop the cleanup timer (and wait out a running UbsShmCallback)
+    // BEFORE finalizing the SDK that the callback calls into.
+    if (UNLIKELY(DestroyShmTimer(g_shm_list) != UBRING_OK)) {
+        LOG(ERROR) << "Ubs shm list finalize failed.";
         return UBRING_ERR;
     }
 
-    if (UNLIKELY(DestroyShmTimer(g_shm_list) != UBRING_OK)) {
-        LOG(ERROR) << "Ubs shm list finalize failed.";
+    int ret = ubsmem_finalize();
+    if (ret != UBSM_OK) {
+        LOG(ERROR) << "Ubs shm finalize fail, ret=" << ret;
         return UBRING_ERR;
     }
 
@@ -489,7 +491,9 @@ RETURN_CODE InitShmTimer(ShmList **shm_list)
 
 RETURN_CODE DestroyShmTimer(ShmList *shm_list)
 {
-    UbrTimerDel(&g_shm_timer_id);
+    // Wait out a possibly running UbsShmCallback: it walks shm_list under
+    // shm_lock and calls the SDK, neither of which may be torn down yet.
+    UbrTimerDelAndWait(&g_shm_timer_id);
     if (shm_list == nullptr) {
         LOG(WARNING) << "Shm list is null.";
         return UBRING_ERR;

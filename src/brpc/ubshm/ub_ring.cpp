@@ -93,9 +93,15 @@ RETURN_CODE UBRing::UbrTrxClose() {
             LOG(WARNING) << "Local shm " << _trx->local_shm.name
             << " wait for the peer to close timed out, force cleanup.";
             _trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
-            // Force synchronous cleanup instead of relying on async timer
-            UbrTimerDel(&_trx->close_timer);
-            UbrTimerDel(&_trx->hb_timer);
+            // Force synchronous cleanup instead of relying on async timer.
+            // Wait out possibly running callbacks before freeing everything
+            // they may still touch. The clear timer is cancelled too: a
+            // concurrent heartbeat callback may have scheduled a delayed
+            // cleanup through the reentry path of UbrPassiveClearTrx, and
+            // this path performs the cleanup itself.
+            UbrTimerDelAndWait(&_trx->close_timer);
+            UbrTimerDelAndWait(&_trx->hb_timer);
+            UbrTimerDelAndWait(&_trx->clear_timer);
             if (_trx->ubr_tx.remote_rx_event_q.addr != nullptr) {
                 ((UbrEventQMsg *)_trx->ubr_tx.remote_rx_event_q.addr)->flag = UBR_STATE_CLOSED;
             }
@@ -180,7 +186,9 @@ RETURN_CODE UBRing::UbrAddTimer() {
     }
 
     if (UNLIKELY(UbrAddHBTimer() != UBRING_OK)) {
-        UbrTimerDel(&_trx->close_timer);
+        // Called from the connect setup thread, never from a timer
+        // callback, so waiting out a running close callback is safe.
+        UbrTimerDelAndWait(&_trx->close_timer);
         LOG(ERROR) << "Ubr " << _trx->local_shm.name << " add heartbeat timer failed.";
         return UBRING_ERR;
     }
@@ -259,19 +267,21 @@ RETURN_CODE UBRing::UbrPassiveClearTrx(UbrTrx *trx, int fd, PASSIVE_DISC_TYPE ty
     const char *type_name =
         (type == UBR_HEARTBEAT) ? "Trx heartbeat" : "Ub event callback";
     // Stop both timers first so no pending callback touches the trx while
-    // it is being released.
+    // it is being released. Non-blocking on purpose: this may run inside
+    // the heartbeat callback itself, which must not wait on its own task.
     UbrTimerDel(&trx->close_timer);
     UbrTimerDel(&trx->hb_timer);
     // Wait for in-flight IO on a one-shot timer instead of sleeping on the
-    // timer thread.
-    if (trx->clear_timer != nullptr) {
-        // A delayed cleanup has already been scheduled.
-        return UBRING_OK;
+    // timer thread. The slot reservation is atomic, so a concurrent close
+    // path cannot schedule a second delayed cleanup for this trx.
+    RETURN_CODE clear_rc = UbrTimerStartOnce(
+        &trx->clear_timer,
+        (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
+        UbrPassiveClearCallback, (void*)trx);
+    if (clear_rc == UBRING_REENTRY) {
+        return UBRING_OK;                        // cleanup already scheduled
     }
-    UbrTimerStart(&trx->clear_timer,
-                  (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
-                  UbrPassiveClearCallback, (void*)trx);
-    if (UNLIKELY(trx->clear_timer == nullptr)) {
+    if (UNLIKELY(clear_rc != UBRING_OK)) {
         LOG(ERROR) << type_name << ", add delayed clear timer failed, name=" << trx->local_shm.name;
         return UBRING_ERR;
     }
@@ -284,6 +294,10 @@ void* UBRing::UbrPassiveClearCallback(void* args) {
         LOG(ERROR) << "Trx passive clear callback failed, trx is null.";
         return nullptr;
     }
+
+    // Consume this one-shot timer before releasing the trx that holds its
+    // handle slot.
+    UbrTimerDel(&trx->clear_timer);
 
     int rc = ShmLocalFree(&trx->remote_shm);
     if (rc != UBRING_OK) {
@@ -345,14 +359,16 @@ RETURN_CODE UBRing::UbrAddAsynClearTimer(UbrTrx *trx) {
         return UBRING_ERR;
     }
 
-    if (trx->clear_timer != nullptr) {
-        return UBRING_OK;
+    // The slot reservation is atomic, so a concurrent close path cannot
+    // schedule a second delayed cleanup for the same trx.
+    RETURN_CODE rc = UbrTimerStartOnce(
+        &trx->clear_timer,
+        (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
+        UbrAsynClearCallback, (void*)trx);
+    if (rc == UBRING_REENTRY) {
+        return UBRING_OK;                        // cleanup already scheduled
     }
-
-    UbrTimerStart(&trx->clear_timer,
-                  (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
-                  UbrAsynClearCallback, (void*)trx);
-    if (UNLIKELY(trx->clear_timer == nullptr)) {
+    if (UNLIKELY(rc != UBRING_OK)) {
         LOG(ERROR) << "Start ubr clear timer failed, trx name=" << trx->local_shm.name;
         return UBRING_ERR;
     }
@@ -366,6 +382,10 @@ void *UBRing::UbrAsynClearCallback(void *args)
         LOG(ERROR) << "Trx close, trx is null.";
         return nullptr;
     }
+
+    // Consume this one-shot timer before releasing the trx that holds its
+    // handle slot.
+    UbrTimerDel(&trx->clear_timer);
 
     if (UNLIKELY(UbrTrxFreeShm(trx) != UBRING_OK)) {
         LOG(ERROR) << "Trx close, wait for local shm " << trx->local_shm.name << " free fail.";
@@ -945,8 +965,11 @@ RETURN_CODE UBRing::UbrMapRemoteShmAddTimer(SHM *local_trx_shm, const char *loca
     uint32_t timeout = ((UbrDataStatusQMsg *)(_trx->ubr_tx.local_data_status_q.addr))->timeout;
     if (HasTimedOut(start_time, timeout) != UBRING_OK) {
         LOG(ERROR) << "Local shm " << local_trx_shm->name << " wait for connect remote map timeout.";
-        UbrTimerDel(&_trx->hb_timer);
-        UbrTimerDel(&_trx->close_timer);
+        // Connect-setup context, never a timer callback: waiting out a
+        // running callback is safe and keeps the freed remote shm
+        // unreachable from pending callbacks.
+        UbrTimerDelAndWait(&_trx->hb_timer);
+        UbrTimerDelAndWait(&_trx->close_timer);
         ShmRemoteFree(&_trx->remote_shm);
         return UBRING_ERR_TIMEOUT;
     }
@@ -1050,7 +1073,9 @@ RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrC
     }
 
     // Safe even when called from inside the close callback itself, so the
-    // former eager/lazy distinction between close types is no longer needed.
+    // former eager/lazy distinction between close types is no longer
+    // needed. Non-blocking on purpose: this runs on the timer thread in
+    // that case and must not wait on its own task.
     UNREFERENCE_PARAM(close_type);
     UbrTimerDel(&trx->close_timer);
     UbrTimerDel(&trx->hb_timer);
