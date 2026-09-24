@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <atomic>
 #include <new>
 #include "bthread/bthread.h"                     // bthread_usleep
 #include "bthread/unstable.h"                    // bthread_timer_add/del
+#include "butil/atomicops.h"
 #include "butil/time.h"
 #include "brpc/ubshm/timer/timer_mgr.h"
 
@@ -35,6 +35,11 @@ enum UbrTimerState {
 
 }  // namespace
 
+// The handle slot is caller-owned plain memory, so it is accessed through a
+// butil::atomic<T*> view; the layout must match for that cast to be valid.
+BAIDU_CASSERT(sizeof(UbrTimerId) == sizeof(butil::atomic<UbrTimerId>),
+              ubr_timer_id_atomic_size_match);
+
 // Reference rules: one "owner" ref for the handle slot, one "schedule" ref
 // per pending/running bthread schedule, plus one ref held by the starter
 // until its post-schedule bookkeeping is done. The schedule ref is
@@ -47,17 +52,17 @@ enum UbrTimerState {
 // free the task while a callback or the starter still touches it.
 struct UbrTimerTask {
     UbrTimerId* slot;
-    std::atomic<bthread_timer_t> id;
+    butil::atomic<bthread_timer_t> id;
     void* (*cb)(void*);
     void* arg;
     UbrTimerBackoffFn backoff;
     uint64_t interval_us;                        // timer thread only
     bool periodic;
-    std::atomic<int> state;                      // kStarting/kScheduled/kDead
-    std::atomic<bool> stopped;
-    std::atomic<int> ref;
-    std::atomic<bool> join_pending;              // a DelAndWait is waiting
-    std::atomic<bool> done;                      // refs hit zero, joiner frees
+    butil::atomic<int> state;                    // kStarting/kScheduled/kDead
+    butil::atomic<bool> stopped;
+    butil::atomic<int> ref;
+    butil::atomic<bool> join_pending;            // a DelAndWait is waiting
+    butil::atomic<bool> done;                    // refs hit zero, joiner frees
 };
 
 namespace {
@@ -118,8 +123,8 @@ void UbrTimerOnFire(void* p) {
     // the slot is the single arbiter.
     UbrTimerId expected = task;
     const bool owned =
-        __atomic_compare_exchange_n(task->slot, &expected, (UbrTimerId) nullptr,
-                                    false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        reinterpret_cast<butil::atomic<UbrTimerId>*>(task->slot)
+            ->compare_exchange_strong(expected, nullptr);
     if (owned) {
         task->cb(task->arg);
     }
@@ -130,19 +135,19 @@ void UbrTimerOnFire(void* p) {
 }
 
 UbrTimerTask* TakeOutTask(UbrTimerId* slot) {
-    return __atomic_exchange_n(slot, (UbrTimerId) nullptr, __ATOMIC_SEQ_CST);
+    return reinterpret_cast<butil::atomic<UbrTimerId>*>(slot)->exchange(nullptr);
 }
 
 RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
                                uint64_t interval_us, void* (*cb)(void*),
                                void* arg, UbrTimerBackoffFn backoff) {
-    if (UNLIKELY(slot == nullptr || cb == nullptr)) {
+    if (BAIDU_UNLIKELY(slot == nullptr || cb == nullptr)) {
         LOG(ERROR) << "Ubr timer start invalid argument, slot=" << slot;
         return UBRING_ERR;
     }
 
     UbrTimerTask* task = new (std::nothrow) UbrTimerTask();
-    if (UNLIKELY(task == nullptr)) {
+    if (BAIDU_UNLIKELY(task == nullptr)) {
         LOG(ERROR) << "Fail to malloc ubring timer task.";
         return UBRING_ERR;
     }
@@ -162,24 +167,23 @@ RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
     // Publish the real task before scheduling so a delete or a DelAndWait
     // racing the start always has an object to act on or wait for.
     UbrTimerId expected = nullptr;
-    if (!__atomic_compare_exchange_n(slot, &expected, (UbrTimerId) task, false,
-                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    if (!reinterpret_cast<butil::atomic<UbrTimerId>*>(slot)
+             ->compare_exchange_strong(expected, task)) {
         LOG(ERROR) << "Ubr timer start refused, slot already occupied";
         delete task;                             // never published
         return UBRING_ERR;
     }
 
     bthread_timer_t id = 0;
-    if (UNLIKELY(bthread_timer_add(
+    if (BAIDU_UNLIKELY(bthread_timer_add(
             &id, butil::microseconds_from_now((int64_t)delay_us),
             UbrTimerOnFire, task) != 0)) {
         LOG(ERROR) << "Fail to add ubring timer";
         task->state.store(kDead);                // wake DelAndWait waiters
         expected = task;
         const bool owned =
-            __atomic_compare_exchange_n(slot, &expected, (UbrTimerId) nullptr,
-                                        false, __ATOMIC_SEQ_CST,
-                                        __ATOMIC_SEQ_CST);
+            reinterpret_cast<butil::atomic<UbrTimerId>*>(slot)
+                ->compare_exchange_strong(expected, nullptr);
         ReleaseRef(task);                        // schedule, never ran
         if (owned) {
             ReleaseRef(task);                    // owner
