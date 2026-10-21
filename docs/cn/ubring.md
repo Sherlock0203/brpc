@@ -64,6 +64,15 @@ cmake -B build
 cmake --build build -j 8
 ```
 
+### 使用 Make 构建
+
+```bash
+# 构建 brpc 并启用 UBRing 支持
+cd /path/to/brpc
+sh config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-ubring
+make -j$(nproc)
+```
+
 ### 使用 Bazel 构建
 
 使用 Bazel 构建带有 UBRing 支持的 brpc：

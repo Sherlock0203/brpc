@@ -63,6 +63,15 @@ cmake -B build
 cmake --build build -j 8
 ```
 
+### Build with Make
+
+```bash
+# Build brpc with UBRing support
+cd /path/to/brpc
+sh config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-ubring
+make -j$(nproc)
+```
+
 ### Build with Bazel
 
 To build brpc with UBRing support using Bazel:
