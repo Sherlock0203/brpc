@@ -16,6 +16,8 @@
 /output
 /test/output
 build/
+# Local out-of-tree builds (build-asan, build-cov, ...).
+/build-*/
 
 # Ignore hidden files
 .*
@@ -36,7 +38,7 @@ compile_commands.json
 CTestTestfile.cmake
 /CPackSourceConfig.cmake
 /CPackConfig.cmake
-/cmake-build-debug/
+/cmake-build-*/
 /googletest-download/
 /googletest-src/
 /test/rpc_data/
