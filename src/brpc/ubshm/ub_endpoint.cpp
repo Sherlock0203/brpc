@@ -936,7 +936,11 @@ void UBShmEndpoint::PollOut(UBShmEndpoint* ep, uint32_t ep_event) {
 }
 
 int UBShmEndpoint::GlobalInitialize() {
-    g_ubring_resource_mutex = new butil::Mutex;
+    // GlobalInitialize may follow a GlobalRelease within one process (tests do
+    // exactly that for every fixture); do not orphan the previous allocation.
+    if (g_ubring_resource_mutex == nullptr) {
+        g_ubring_resource_mutex = new butil::Mutex;
+    }
     _poller_groups = std::vector<PollerGroup>(FLAGS_task_group_ntags);
     return 0;
 }
@@ -945,6 +949,8 @@ void UBShmEndpoint::GlobalRelease() {
     for (int i = 0; i < FLAGS_task_group_ntags; ++i) {
         PollingModeRelease(i);
     }
+    delete g_ubring_resource_mutex;
+    g_ubring_resource_mutex = nullptr;
 }
 
 std::vector<UBShmEndpoint::PollerGroup> UBShmEndpoint::_poller_groups;
