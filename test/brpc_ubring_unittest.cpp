@@ -2133,6 +2133,30 @@ TEST_F(UBRingTest, legacy_recv_honors_partial_buffer_and_chunk_cursor) {
               LocalChunk(0)->header[UBR_MSG_CUR_INDEX]);
 }
 
+TEST_F(UBRingTest, recv_block_mode_reads_success_and_partial) {
+    InitLegacy();
+    MakeChunk(LocalChunk(0), UBR_MSG_CHUNK_EXIST, UBR_MSG_PAYLOAD_LEN, 0,
+              'a');
+    MakeChunk(LocalChunk(1), UBR_MSG_CHUNK_EOF, 10, 0, 'b');
+
+    std::string first(30, '?');
+    ASSERT_EQ(30, _ring.UbrTrxRecvBlockMode(
+                      reinterpret_cast<uint8_t*>(&first[0]), first.size()));
+    EXPECT_EQ(std::string(30, 'a'), first);
+    EXPECT_EQ(0u, _trx.ubr_rx.read_pos);
+    EXPECT_EQ(30, LocalChunk(0)->header[UBR_MSG_CUR_INDEX]);
+
+    // The second call drains the rest of the first chunk and the EOF chunk.
+    std::string rest(60, '?');
+    ASSERT_EQ(40, _ring.UbrTrxRecvBlockMode(
+                      reinterpret_cast<uint8_t*>(&rest[0]), rest.size()));
+    EXPECT_EQ(std::string(30, 'a') + std::string(10, 'b'),
+              rest.substr(0, 40));
+    // The buffer is larger than the message; only the message is consumed.
+    EXPECT_EQ(std::string(20, '?'), rest.substr(40));
+    EXPECT_EQ(2u, _trx.ubr_rx.read_pos);
+}
+
 TEST_F(UBRingTest, legacy_recv_rejects_crafted_chunk_header) {
     InitLegacy();
     MakeChunk(LocalChunk(0), UBR_MSG_CHUNK_EOF, 255, 0, 'x');
@@ -2596,13 +2620,45 @@ protected:
         UBShmEndpoint::GlobalRelease();
         UBRingManager::UbrMgrFini();
         ShmMgrFini();
+        // A failed test may leave the object behind; never rely on the next
+        // run being able to O_EXCL-create the same name.
+        for (const auto& name : _shm_names) {
+            shm_unlink(name.c_str());
+        }
         g_skip_ub_init = _saved_skip;
+    }
+
+    // Names are unique per process and call, so a crashed previous run cannot
+    // make ShmLocalCalloc fail with SHM_ERR_EXIST.
+    std::string UniqueShmName(const char* tag) {
+        static std::atomic<int> sequence(0);
+        std::string name = std::string("ut_") + tag + "_" +
+                           std::to_string(getpid()) + "_" +
+                           std::to_string(sequence.fetch_add(1));
+        // AllocateClientResources prefixes "UBRING_" and the client suffix; the
+        // cleanup name is recorded here so TearDown can unlink it even if the
+        // test failed before filling in the SHM. Remove a leftover from a
+        // crashed run that happened to reuse this pid and sequence.
+        const std::string shm_name = std::string("UBRING_") + name + "_C";
+        shm_unlink(shm_name.c_str());
+        _shm_names.push_back(shm_name);
+        return name;
+    }
+
+    // Let the close path skip its disconnect-timeout spin: the peer is
+    // simulated as already closed in the local receive event queue.
+    static void MarkPeerClosed(const brpc::ubring::SHM& local_trx_shm) {
+        ASSERT_NE(nullptr, local_trx_shm.addr);
+        reinterpret_cast<brpc::ubring::UbrEventQMsg*>(
+            local_trx_shm.addr + RX_EVENTQ_ADDR_OFFSET)->flag =
+            brpc::ubring::UBR_STATE_CLOSED;
     }
 
     brpc::SocketId _socket_id = brpc::INVALID_SOCKET_ID;
     brpc::Socket* _socket = nullptr;
     UBShmEndpoint* _ep = nullptr;
     bool _saved_skip = false;
+    std::vector<std::string> _shm_names;
 };
 }  // namespace ubring
 }  // namespace brpc
@@ -2627,14 +2683,18 @@ TEST_F(UBShmEndpointTest, reset_clears_negotiated_data_format) {
 TEST_F(UBShmEndpointTest, allocate_client_resources_real_shm) {
     brpc::ubring::SHM local_trx_shm =
         {nullptr, 4 * 1024 * 1024, 0, {0}, (uint32_t)_socket->fd()};
-    int ret = _ep->AllocateClientResources(&local_trx_shm, "UBRING_ut_client");
-    EXPECT_EQ(0, ret);
+    const std::string name = UniqueShmName("client");
+    int ret = _ep->AllocateClientResources(&local_trx_shm, name.c_str());
+    ASSERT_EQ(0, ret);
+    MarkPeerClosed(local_trx_shm);
 }
 
 TEST_F(UBShmEndpointTest, reset_cleans_up_resources) {
     brpc::ubring::SHM local_trx_shm =
         {nullptr, 4 * 1024 * 1024, 0, {0}, (uint32_t)_socket->fd()};
-    _ep->AllocateClientResources(&local_trx_shm, "UBRING_ut_reset");
+    const std::string name = UniqueShmName("reset");
+    ASSERT_EQ(0, _ep->AllocateClientResources(&local_trx_shm, name.c_str()));
+    MarkPeerClosed(local_trx_shm);
     _ep->Reset();
 }
 
