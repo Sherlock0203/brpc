@@ -619,7 +619,7 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         int result = snprintf(local_trx_shm.name, SHM_MAX_NAME_BUFF_LEN, "%s_%s",
             client_name, SERVER_SHM_NAME_SUFFIX);
-        if (UNLIKELY(result < 0)) {
+        if (BAIDU_UNLIKELY(result < 0)) {
             LOG(WARNING) << "Copy client shared memory name failed, ret=" << result;
             ub_transport->_ub_state = UBShmTransport::UB_OFF;
         }
@@ -773,14 +773,14 @@ ssize_t UBShmEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     ssize_t nw = 0;
     errno = 0;
     nw = _ub_ring->UbrTrxWritev(vec, nvec);
-    if (UNLIKELY(nw == -1)) {
+    if (BAIDU_UNLIKELY(nw == -1)) {
         if (errno == EMSGSIZE) {
             LOG(ERROR) << "Non-blocking send msg failed, message is larger than ubring capacity.";
         } else {
             LOG(ERROR) << "Non-blocking send msg in failed, connection has been closed.";
             errno = EPIPE;
         }
-    } else if (UNLIKELY(nw == UBRING_RETRY)) {
+    } else if (BAIDU_UNLIKELY(nw == UBRING_RETRY)) {
         errno = EAGAIN;
         nw = -1;
     }
@@ -936,7 +936,11 @@ void UBShmEndpoint::PollOut(UBShmEndpoint* ep, uint32_t ep_event) {
 }
 
 int UBShmEndpoint::GlobalInitialize() {
-    g_ubring_resource_mutex = new butil::Mutex;
+    // GlobalInitialize may follow a GlobalRelease within one process (tests do
+    // exactly that for every fixture); do not orphan the previous allocation.
+    if (g_ubring_resource_mutex == nullptr) {
+        g_ubring_resource_mutex = new butil::Mutex;
+    }
     _poller_groups = std::vector<PollerGroup>(FLAGS_task_group_ntags);
     return 0;
 }
@@ -945,6 +949,8 @@ void UBShmEndpoint::GlobalRelease() {
     for (int i = 0; i < FLAGS_task_group_ntags; ++i) {
         PollingModeRelease(i);
     }
+    delete g_ubring_resource_mutex;
+    g_ubring_resource_mutex = nullptr;
 }
 
 std::vector<UBShmEndpoint::PollerGroup> UBShmEndpoint::_poller_groups;
@@ -962,7 +968,7 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
     }
     struct FnArgs {
         Poller* poller;
-        std::atomic<bool>* running;
+        butil::atomic<bool>* running;
     };
     auto fn = [](void* p) -> void* {
         std::unique_ptr<FnArgs> args(static_cast<FnArgs*>(p));
@@ -977,6 +983,7 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
         while (running->load(std::memory_order_relaxed)) {
             while (poller->op_queue.Dequeue(op)) {
                 if (op.type == PollerSidOp::ADD) {
+                    poller_sids.erase(op);
                     poller_sids.emplace(op);
                 } else if (op.type == PollerSidOp::REMOVE) {
                     poller_sids.erase(op);

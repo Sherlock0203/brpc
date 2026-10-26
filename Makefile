@@ -207,6 +207,9 @@ BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/
 ifeq ($(WITH_URMA),1)
 BRPC_DIRS += src/brpc/urma
 endif
+ifeq ($(WITH_UBRING),1)
+BRPC_DIRS += src/brpc/ubshm src/brpc/ubshm/shm src/brpc/ubshm/timer src/brpc/ubshm/ubs_mem
+endif
 THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
 EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
 BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
